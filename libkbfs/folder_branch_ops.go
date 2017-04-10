@@ -3604,7 +3604,7 @@ func (fbo *folderBranchOps) Sync(ctx context.Context, file Node) (err error) {
 }
 
 func (fbo *folderBranchOps) syncAllLocked(
-	ctx context.Context, lState *lockState) error {
+	ctx context.Context, lState *lockState) (err error) {
 	fbo.mdWriterLock.AssertLocked(lState)
 
 	dirtyRefs := fbo.blocks.GetDirtyRefs(lState)
@@ -3612,13 +3612,161 @@ func (fbo *folderBranchOps) syncAllLocked(
 		return nil
 	}
 
-	fbo.log.CDebugf(ctx, "Syncing %d file(s)", len(dirtyRefs))
-	/**
-	for _, ref := range dirtyRefs {
-
+	// Verify we have permission to write.  We do this after the dirty
+	// check because otherwise readers who sync clean files on close
+	// would get an error.
+	md, err := fbo.getMDForWriteLocked(ctx, lState)
+	if err != nil {
+		return err
 	}
-	*/
-	return nil
+
+	var cleanupFns []func(error)
+	defer func() {
+		for _, cf := range cleanupFns {
+			cf(err)
+		}
+	}()
+
+	fbo.log.CDebugf(ctx, "Syncing %d file(s)", len(dirtyRefs))
+	bps := newBlockPutState(0)
+	resolvedPaths := make(map[BlockPointer]path)
+	fileBlocks := make(fileBlockMap)
+	var blocksToRemove []BlockPointer
+	var afterUpdateFns []func() error
+	for _, ref := range dirtyRefs {
+		node := fbo.nodeCache.Get(ref)
+		if node == nil {
+			continue
+		}
+		file := fbo.nodeCache.PathFromNode(node)
+		fbo.log.CDebugf(ctx, "Syncing file %v (%p)", ref, file)
+
+		doSync, stillDirty, fblock, _, newBps, syncState, cleanupFn, err :=
+			fbo.startSyncLocked(ctx, lState, md, file)
+		if cleanupFn != nil {
+			// XXX: This passes the same `blocksToRemove` into each cleanup
+			// function.  Is that ok?
+			cleanupFns = append(cleanupFns,
+				func(err error) { cleanupFn(blocksToRemove, err) })
+		}
+		if err != nil {
+			return err
+		}
+		if !doSync {
+			if !stillDirty {
+				fbo.status.rmDirtyNode(node)
+			}
+			continue
+		}
+
+		bps.mergeOtherBps(newBps)
+		resolvedPaths[file.tailPointer()] = file
+		parent := file.parentPath().tailPointer()
+
+		if _, ok := fileBlocks[parent]; !ok {
+			fileBlocks[parent] = make(map[string]*FileBlock)
+		}
+		fileBlocks[parent][file.tailName()] = fblock
+
+		afterUpdateFns = append(afterUpdateFns, func() error {
+			// This will be called after the node cache is updated, so
+			// this newPath will be correct.
+			newPath := fbo.nodeCache.PathFromNode(node)
+			stillDirty, err := fbo.blocks.FinishSyncLocked(
+				ctx, lState, file, newPath, md.ReadOnly(), syncState, fbo.fbm)
+			if !stillDirty {
+				fbo.status.rmDirtyNode(node)
+			}
+			return err
+		})
+	}
+
+	// Make each of the ops "self-updates" before making chains (they
+	// will be updated later to have the correct block pointers).
+	for _, op := range md.Data().Changes.Ops {
+		switch realOp := op.(type) {
+		case *syncOp:
+			realOp.File.Ref = realOp.File.Unref
+		default:
+			panic(fmt.Sprintf("syncAllLocked: unexpected op type %T", op))
+		}
+	}
+
+	session, err := fbo.config.KBPKI().GetCurrentSession(ctx)
+	if err != nil {
+		return err
+	}
+	tempIRMD := ImmutableRootMetadata{
+		ReadOnlyRootMetadata:   md.ReadOnly(),
+		lastWriterVerifyingKey: session.VerifyingKey,
+	}
+
+	syncChains, err := newCRChains(
+		ctx, fbo.config.Codec(), []chainMetadata{tempIRMD}, &fbo.blocks, false)
+	if err != nil {
+		return err
+	}
+
+	head, _ := fbo.getHead(lState)
+	dummyHeadChains := newCRChainsEmpty()
+	dummyHeadChains.mostRecentChainMDInfo = mostRecentChainMetadataInfo{
+		head, head.Data().Dir.BlockInfo}
+
+	// Use an empty local block cache, to force the syncer to get the
+	// fully-dirtied dir blocks, rather that the ones returned by
+	// StartSync that only contain a single dirty entry.
+	lbc := make(localBcache)
+
+	resOp := newResolutionOp()
+	md.Data().Changes.Ops = append([]op{resOp}, md.Data().Changes.Ops...)
+	_, newBps, blocksToDelete, err := fbo.prepper.prepUpdateForPaths(
+		ctx, lState, md, syncChains, dummyHeadChains, tempIRMD, head,
+		resolvedPaths, lbc, fileBlocks, fbo.config.DirtyBlockCache())
+	if err != nil {
+		return err
+	}
+	if len(blocksToDelete) > 0 {
+		return errors.Errorf("Unexpectedly found unflushed blocks to delete "+
+			"during syncAllLocked: %v", blocksToDelete)
+	}
+	bps.mergeOtherBps(newBps)
+
+	defer func() {
+		if err != nil {
+			fbo.fbm.cleanUpBlockState(md.ReadOnly(), bps, blockDeleteOnMDFail)
+		}
+	}()
+
+	// Put all the blocks.
+	blocksToRemove, err = doBlockPuts(ctx, fbo.config.BlockServer(),
+		fbo.config.BlockCache(), fbo.config.Reporter(), fbo.log, md.TlfID(),
+		md.GetTlfHandle().GetCanonicalName(), *bps)
+	if err != nil {
+		return err
+	}
+
+	// Call this under the same blockLock as when the pointers are
+	// updated, so there's never any point in time where a read or
+	// write might slip in after the pointers are updated, but before
+	// the deferred writes are re-applied.
+	afterUpdateFn := func() error {
+		var errs []error
+		for _, auf := range afterUpdateFns {
+			err := auf()
+			if err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if len(errs) == 1 {
+			return errs[0]
+		} else if len(errs) > 1 {
+			return errors.Errorf("Got errors %+v", errs)
+		}
+		return nil
+	}
+
+	return fbo.finalizeMDWriteLocked(
+		ctx, lState, md, bps, NoExcl, afterUpdateFn)
 }
 
 // Sync implements the KBFSOps interface for folderBranchOps.
