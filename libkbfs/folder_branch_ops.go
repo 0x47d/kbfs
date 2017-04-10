@@ -3639,7 +3639,7 @@ func (fbo *folderBranchOps) syncAllLocked(
 			continue
 		}
 		file := fbo.nodeCache.PathFromNode(node)
-		fbo.log.CDebugf(ctx, "Syncing file %v (%p)", ref, file)
+		fbo.log.CDebugf(ctx, "Syncing file %v (%s)", ref, file)
 
 		doSync, stillDirty, fblock, _, newBps, syncState, cleanupFn, err :=
 			fbo.startSyncLocked(ctx, lState, md, file)
@@ -3679,16 +3679,14 @@ func (fbo *folderBranchOps) syncAllLocked(
 			}
 			return err
 		})
-	}
 
-	// Make each of the ops "self-updates" before making chains (they
-	// will be updated later to have the correct block pointers).
-	for _, op := range md.Data().Changes.Ops {
-		switch realOp := op.(type) {
-		case *syncOp:
-			realOp.File.Ref = realOp.File.Unref
-		default:
-			panic(fmt.Sprintf("syncAllLocked: unexpected op type %T", op))
+		// Make each of the ops "self-updates" before making chains
+		// (they will be updated later to have the correct block
+		// pointers).  Add an update for each element in the path, so
+		// that the chains below are created correctly.
+		lastOp := md.Data().Changes.Ops[len(md.Data().Changes.Ops)-1]
+		for _, p := range file.path[:len(file.path)-1] {
+			lastOp.AddUpdate(p.BlockPointer, p.BlockPointer)
 		}
 	}
 
@@ -3717,8 +3715,7 @@ func (fbo *folderBranchOps) syncAllLocked(
 	// StartSync that only contain a single dirty entry.
 	lbc := make(localBcache)
 
-	resOp := newResolutionOp()
-	md.Data().Changes.Ops = append([]op{resOp}, md.Data().Changes.Ops...)
+	md.AddOp(newResolutionOp())
 	_, newBps, blocksToDelete, err := fbo.prepper.prepUpdateForPaths(
 		ctx, lState, md, syncChains, dummyHeadChains, tempIRMD, head,
 		resolvedPaths, lbc, fileBlocks, fbo.config.DirtyBlockCache())
