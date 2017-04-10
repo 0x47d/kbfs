@@ -3442,22 +3442,15 @@ func (fbo *folderBranchOps) SetMtime(
 }
 
 func (fbo *folderBranchOps) startSyncLocked(ctx context.Context,
-	lState *lockState, file path) (
-	doSync bool, bps *blockPutState, cleanupFn func(err error),
-	afterUpdateFn func() error, err error) {
+	lState *lockState, md *RootMetadata, file path) (
+	doSync bool, stillDirty bool, fblock *FileBlock, lbc localBcache,
+	bps *blockPutState, syncState fileSyncState,
+	cleanupFn func([]BlockPointer, error), err error) {
 	fbo.mdWriterLock.AssertLocked(lState)
 
 	// if the cache for this file isn't dirty, we're done
 	if !fbo.blocks.IsDirty(lState, file) {
-		return false, nil, nil, nil, nil
-	}
-
-	// Verify we have permission to write.  We do this after the dirty
-	// check because otherwise readers who sync clean files on close
-	// would get an error.
-	md, err := fbo.getMDForWriteLocked(ctx, lState)
-	if err != nil {
-		return false, nil, nil, nil, err
+		return false, false, nil, nil, nil, fileSyncState{}, nil, nil
 	}
 
 	// If the MD doesn't match the MD expected by the path, that
@@ -3482,12 +3475,13 @@ func (fbo *folderBranchOps) startSyncLocked(ctx context.Context,
 		// perfectly accurate (but at the same time, we'd then have to
 		// fix up the intentional panic in the background flusher to
 		// be more tolerant of long-lived dirty, removed files).
-		return false, nil, nil, nil, fbo.blocks.ClearCacheInfo(lState, file)
+		return false, true, nil, nil, nil, fileSyncState{}, nil,
+			fbo.blocks.ClearCacheInfo(lState, file)
 	}
 
 	session, err := fbo.config.KBPKI().GetCurrentSession(ctx)
 	if err != nil {
-		return false, nil, nil, nil, err
+		return false, true, nil, nil, nil, fileSyncState{}, nil, err
 	}
 
 	if file.isValidForNotification() {
@@ -3497,30 +3491,44 @@ func (fbo *folderBranchOps) startSyncLocked(ctx context.Context,
 	}
 
 	// Filled in by doBlockPuts below.
-	var blocksToRemove []BlockPointer
-	fblock, bps, lbc, syncState, err :=
+	fblock, bps, lbc, syncState, err =
 		fbo.blocks.StartSync(ctx, lState, md, session.UID, file)
-	cleanupFn = func() {
+	cleanupFn = func(blocksToRemove []BlockPointer, err error) {
 		fbo.blocks.CleanupSyncState(
 			ctx, lState, md.ReadOnly(), file, blocksToRemove, syncState, err)
-	}()
+	}
 	if err != nil {
-		return false, nil, cleanupFn, nil, err
+		return false, true, nil, nil, nil, fileSyncState{}, cleanupFn, err
 	}
 
-	// Call this under the same blockLock as when the pointers are
-	// updated, so there's never any point in time where a read or
-	// write might slip in after the pointers are updated, but before
-	// the deferred writes are re-applied.
-	afterUpdateFn := func() error {
-		stillDirty, err = fbo.blocks.FinishSyncLocked(
-			ctx, lState, file, newPath, md.ReadOnly(), syncState, fbo.fbm)
-		return err
-	}
-	return true, bps, cleanupFn, afterUpdateFn, nil
+	return true, true, fblock, lbc, bps, syncState, cleanupFn, nil
 }
 
-func leftOverCrap() {
+func (fbo *folderBranchOps) syncLocked(ctx context.Context,
+	lState *lockState, file path) (stillDirty bool, err error) {
+	fbo.mdWriterLock.AssertLocked(lState)
+
+	// Verify we have permission to write.  We do this after the dirty
+	// check because otherwise readers who sync clean files on close
+	// would get an error.
+	md, err := fbo.getMDForWriteLocked(ctx, lState)
+	if err != nil {
+		return false, err
+	}
+
+	var blocksToRemove []BlockPointer
+	doSync, stillDirty, fblock, lbc, bps, syncState, cleanupFn, err :=
+		fbo.startSyncLocked(ctx, lState, md, file)
+	if cleanupFn != nil {
+		defer func() { cleanupFn(blocksToRemove, err) }()
+	}
+	if err != nil {
+		return stillDirty, err
+	}
+	if !doSync {
+		return stillDirty, nil
+	}
+
 	newPath, _, newBps, err :=
 		fbo.syncBlockAndCheckEmbedLocked(
 			ctx, lState, md, fblock, *file.parentPath(),
@@ -3544,17 +3552,21 @@ func leftOverCrap() {
 		return true, err
 	}
 
+	// Call this under the same blockLock as when the pointers are
+	// updated, so there's never any point in time where a read or
+	// write might slip in after the pointers are updated, but before
+	// the deferred writes are re-applied.
+	afterUpdateFn := func() error {
+		stillDirty, err = fbo.blocks.FinishSyncLocked(
+			ctx, lState, file, newPath, md.ReadOnly(), syncState, fbo.fbm)
+		return err
+	}
+
 	err = fbo.finalizeMDWriteLocked(ctx, lState, md, bps, NoExcl, afterUpdateFn)
 	if err != nil {
 		return true, err
 	}
 	return stillDirty, err
-}
-
-func (fbo *folderBranchOps) syncLocked(ctx context.Context,
-	lState *lockState, file path) (stillDirty bool, err error) {
-	fbo.mdWriterLock.AssertLocked(lState)
-
 }
 
 func (fbo *folderBranchOps) Sync(ctx context.Context, file Node) (err error) {
@@ -3601,14 +3613,17 @@ func (fbo *folderBranchOps) syncAllLocked(
 	}
 
 	fbo.log.CDebugf(ctx, "Syncing %d file(s)", len(dirtyRefs))
+	/**
 	for _, ref := range dirtyRefs {
 
 	}
+	*/
+	return nil
 }
 
 // Sync implements the KBFSOps interface for folderBranchOps.
 func (fbo *folderBranchOps) SyncAll(
-	ctx context.Context, folderBranch FolderBranch) error {
+	ctx context.Context, folderBranch FolderBranch) (err error) {
 	fbo.log.CDebugf(ctx, "SyncAll")
 	defer func() { fbo.deferLog.CDebugf(ctx, "SyncAll done: %+v", err) }()
 
